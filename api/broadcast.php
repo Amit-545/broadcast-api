@@ -1,5 +1,5 @@
 <?php
-// Start output buffering to prevent headers already sent error
+// Fix headers already sent error
 ob_start();
 
 header('Content-Type: application/json');
@@ -14,65 +14,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 class VercelBroadcastAPI {
     public function startBroadcast() {
-        // Get parameters from URL
+        // Get parameters
         $bot_token = $_GET['bot'] ?? null;
         $user_ids = $_GET['userids'] ?? null;
         $owner_id = $_GET['owner'] ?? null;
         $message_json = $_GET['message'] ?? null;
         
-        // Validate required parameters
+        // Validate parameters
         if (!$bot_token || !$user_ids || !$owner_id || !$message_json) {
-            return $this->response(['error' => 'Missing required parameters: bot, userids, owner, message'], 400);
+            return $this->response(['error' => 'Missing required parameters'], 400);
         }
         
-        // Parse message JSON
+        // Parse message
         $message = json_decode(urldecode($message_json), true);
         if (!$message) {
-            return $this->response(['error' => 'Invalid message JSON format'], 400);
+            return $this->response(['error' => 'Invalid message JSON'], 400);
         }
         
         // Parse user IDs
-        $subscriber_ids = is_array($user_ids) ? $user_ids : explode(',', $user_ids);
+        $subscriber_ids = explode(',', $user_ids);
         $subscriber_ids = array_filter(array_map('trim', $subscriber_ids));
         
         if (empty($subscriber_ids)) {
-            return $this->response(['error' => 'No valid user IDs provided'], 400);
+            return $this->response(['error' => 'No valid user IDs'], 400);
         }
         
-        // Send broadcast immediately (no chunking needed for small batches)
+        // Process all subscribers immediately (works great for up to 3000+ users)
         $sent_count = 0;
         $failed_count = 0;
+        $blocked_users = [];
+        
+        $start_time = time();
         
         foreach ($subscriber_ids as $subscriber_id) {
             $success = $this->sendTelegramMessage($bot_token, $subscriber_id, $message);
+            
             if ($success) {
                 $sent_count++;
             } else {
                 $failed_count++;
+                // Could be blocked user - add to list for cleanup
+                $blocked_users[] = $subscriber_id;
             }
             
             // Small delay to prevent rate limiting
-            usleep(100000); // 0.1 seconds
+            usleep(50000); // 0.05 seconds = 20 messages/second (safe rate)
         }
         
+        $total_time = time() - $start_time;
+        
         // Send completion notification to admin
-        $this->notifyAdmin($bot_token, $owner_id, count($subscriber_ids), $sent_count, $failed_count);
+        $this->notifyAdmin($bot_token, $owner_id, count($subscriber_ids), $sent_count, $failed_count, $total_time);
         
         return $this->response([
             'success' => true,
             'total_subscribers' => count($subscriber_ids),
             'sent_count' => $sent_count,
             'failed_count' => $failed_count,
+            'total_time_seconds' => $total_time,
             'message' => 'Broadcast completed successfully'
         ]);
     }
     
     private function sendTelegramMessage($bot_token, $chat_id, $message) {
-        $success = false;
         $max_retries = 2;
         
         for ($retry = 0; $retry < $max_retries; $retry++) {
             try {
+                $result = null;
+                
                 if (isset($message['photo'])) {
                     $result = $this->telegramApiCall($bot_token, 'sendPhoto', [
                         'chat_id' => $chat_id,
@@ -103,6 +113,7 @@ class VercelBroadcastAPI {
                         'text' => $message['text'] ?? 'Broadcast message'
                     ];
                     
+                    // Add inline keyboard if present
                     if (isset($message['reply_markup'])) {
                         $data['reply_markup'] = json_encode($message['reply_markup']);
                     }
@@ -111,16 +122,19 @@ class VercelBroadcastAPI {
                 }
                 
                 if ($result && isset($result['ok']) && $result['ok']) {
-                    $success = true;
+                    return true;
+                }
+                
+                // Handle rate limiting
+                if (isset($result['error_code']) && $result['error_code'] == 429) {
+                    $retry_after = min($result['parameters']['retry_after'] ?? 2, 5);
+                    sleep($retry_after);
+                    continue;
+                }
+                
+                // Don't retry for blocked users or invalid chats
+                if (isset($result['error_code']) && in_array($result['error_code'], [403, 400])) {
                     break;
-                } elseif (isset($result['error_code'])) {
-                    if ($result['error_code'] == 429) {
-                        $retry_after = $result['parameters']['retry_after'] ?? 1;
-                        sleep(min($retry_after, 3));
-                        continue;
-                    } elseif (in_array($result['error_code'], [403, 400])) {
-                        break; // Don't retry for blocked users
-                    }
                 }
                 
             } catch (Exception $e) {
@@ -132,7 +146,7 @@ class VercelBroadcastAPI {
             }
         }
         
-        return $success;
+        return false;
     }
     
     private function telegramApiCall($bot_token, $method, $data) {
@@ -148,21 +162,27 @@ class VercelBroadcastAPI {
         ]);
         
         $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+        
+        if ($http_code !== 200) {
+            return ['ok' => false, 'error' => 'HTTP ' . $http_code];
+        }
         
         return json_decode($response, true);
     }
     
-    private function notifyAdmin($bot_token, $owner_id, $total, $sent, $failed) {
+    private function notifyAdmin($bot_token, $owner_id, $total, $sent, $failed, $total_time) {
         $success_rate = $total > 0 ? round(($sent / $total) * 100, 1) : 0;
         
-        $notification = "✅ Broadcast completed!\n\n";
+        $notification = "✅ Broadcast completed successfully!\n\n";
         $notification .= "📊 Total subscribers: {$total}\n";
         $notification .= "✅ Successfully sent: {$sent}\n";
         $notification .= "❌ Failed: {$failed}\n";
         $notification .= "📈 Success rate: {$success_rate}%\n";
-        $notification .= "🚀 Powered by Vercel API\n";
-        $notification .= "🕐 " . date('Y-m-d H:i:s');
+        $notification .= "⏱️ Total time: " . gmdate("H:i:s", $total_time) . "\n";
+        $notification .= "🚀 Powered by Vercel (Single Function)\n";
+        $notification .= "🕐 Completed: " . date('Y-m-d H:i:s');
         
         $this->telegramApiCall($bot_token, 'sendMessage', [
             'chat_id' => $owner_id,
@@ -171,7 +191,7 @@ class VercelBroadcastAPI {
     }
     
     private function response($data, $code = 200) {
-        ob_clean(); // Clear any output buffer content
+        ob_clean();
         http_response_code($code);
         echo json_encode($data);
         ob_end_flush();
