@@ -1,11 +1,10 @@
 <?php
-// Fix headers already sent error
 ob_start();
 
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     ob_end_flush();
@@ -14,32 +13,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 class VercelBroadcastAPI {
     public function startBroadcast() {
-        // Get parameters
-        $bot_token = $_GET['bot'] ?? null;
-        $user_ids = $_GET['userids'] ?? null;
-        $owner_id = $_GET['owner'] ?? null;
-        $message_json = $_GET['message'] ?? null;
-        
-        // Validate parameters
-        if (!$bot_token || !$user_ids || !$owner_id || !$message_json) {
-            return $this->response(['error' => 'Missing required parameters'], 400);
+        // Handle both GET (for small tests) and POST (for large broadcasts)
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $input = file_get_contents('php://input');
+            $data = json_decode($input, true);
+            
+            if (!$data) {
+                return $this->response(['error' => 'Invalid JSON payload'], 400);
+            }
+            
+            $bot_token = $data['bot_token'] ?? null;
+            $user_ids = $data['user_ids'] ?? null;
+            $owner_id = $data['owner_id'] ?? null;
+            $message = $data['message'] ?? null;
+            
+        } else {
+            // GET method for small tests
+            $bot_token = $_GET['bot'] ?? null;
+            $user_ids = $_GET['userids'] ?? null;
+            $owner_id = $_GET['owner'] ?? null;
+            $message_json = $_GET['message'] ?? null;
+            $message = $message_json ? json_decode(urldecode($message_json), true) : null;
         }
         
-        // Parse message
-        $message = json_decode(urldecode($message_json), true);
-        if (!$message) {
-            return $this->response(['error' => 'Invalid message JSON'], 400);
+        // Validate required parameters
+        if (!$bot_token || !$user_ids || !$owner_id || !$message) {
+            return $this->response(['error' => 'Missing required parameters: bot_token, user_ids, owner_id, message'], 400);
         }
         
         // Parse user IDs
-        $subscriber_ids = explode(',', $user_ids);
+        if (is_string($user_ids)) {
+            $subscriber_ids = explode(',', $user_ids);
+        } else {
+            $subscriber_ids = $user_ids;
+        }
         $subscriber_ids = array_filter(array_map('trim', $subscriber_ids));
         
         if (empty($subscriber_ids)) {
-            return $this->response(['error' => 'No valid user IDs'], 400);
+            return $this->response(['error' => 'No valid user IDs provided'], 400);
         }
         
-        // Process all subscribers immediately (works great for up to 3000+ users)
+        // Process all subscribers immediately
         $sent_count = 0;
         $failed_count = 0;
         $blocked_users = [];
@@ -53,12 +67,11 @@ class VercelBroadcastAPI {
                 $sent_count++;
             } else {
                 $failed_count++;
-                // Could be blocked user - add to list for cleanup
                 $blocked_users[] = $subscriber_id;
             }
             
             // Small delay to prevent rate limiting
-            usleep(50000); // 0.05 seconds = 20 messages/second (safe rate)
+            usleep(50000); // 0.05 seconds = 20 messages/second
         }
         
         $total_time = time() - $start_time;
@@ -71,6 +84,7 @@ class VercelBroadcastAPI {
             'total_subscribers' => count($subscriber_ids),
             'sent_count' => $sent_count,
             'failed_count' => $failed_count,
+            'blocked_count' => count($blocked_users),
             'total_time_seconds' => $total_time,
             'message' => 'Broadcast completed successfully'
         ]);
@@ -181,7 +195,7 @@ class VercelBroadcastAPI {
         $notification .= "❌ Failed: {$failed}\n";
         $notification .= "📈 Success rate: {$success_rate}%\n";
         $notification .= "⏱️ Total time: " . gmdate("H:i:s", $total_time) . "\n";
-        $notification .= "🚀 Powered by Vercel (Single Function)\n";
+        $notification .= "🚀 Powered by Vercel API (POST Method)\n";
         $notification .= "🕐 Completed: " . date('Y-m-d H:i:s');
         
         $this->telegramApiCall($bot_token, 'sendMessage', [
@@ -200,7 +214,7 @@ class VercelBroadcastAPI {
 }
 
 // Handle request
-if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+if (in_array($_SERVER['REQUEST_METHOD'], ['GET', 'POST'])) {
     try {
         $api = new VercelBroadcastAPI();
         $api->startBroadcast();
