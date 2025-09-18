@@ -1,0 +1,14 @@
+{
+  "functions": {
+    "api/*.php": {
+      "runtime": "vercel-php@0.7.4",
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/$1" }
+  ],
+  "env": {
+    "TEMP_STORAGE_PATH": "/tmp"
+  }
+}
